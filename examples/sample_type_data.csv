@@ -1,0 +1,7 @@
+employee_id,name,age,salary,start_date,approved
+EMP001,Alice,25,55000.50,2026-01-15,yes
+EMP002,Bob,thirty,62000,2026-02-30,no
+EMP003,Charlie,29.5,unknown,15/03/2026,true
+EMP004,Diana,,71000.75,2026-04-01,maybe
+EMP005,Evan,40,,not-a-date,1
+EMP006,Faye,35,68000,2026-06-10,0
