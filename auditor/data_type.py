@@ -1,11 +1,13 @@
 import pandas as pd
 
+from auditor.profiler import _missing_series_mask
+
 def validate_expected_type(series, rule):
     """
     Validate the data type of a DataFrame column against expected types.
     """
     expected_type = rule["type"].lower()
-    non_missing = series.notna()
+    non_missing = ~_missing_series_mask(series)
 
     if expected_type == "integer":
         converted = pd.to_numeric(series, errors="coerce")
@@ -77,7 +79,7 @@ def type_inference(series, STRONG_THRESHOLD=90, MIN_THRESHOLD=60):
     """
     Suggest a data type this column most likely represents
     """
-    non_missing_series = series.dropna()
+    non_missing_series = series[~_missing_series_mask(series)]
     values_tested = len(non_missing_series)
 
     if non_missing_series.empty:

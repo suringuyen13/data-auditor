@@ -1,11 +1,8 @@
 import argparse
 
-from auditor.category import detect_category_issues
 from auditor.config import load_rules
-from auditor.data_type import detect_type_issues
 from auditor.loader import load_csv
-from auditor.outliers import detect_outliers_iqr
-from auditor.profiler import detect_missing_values, profile_dataset
+from auditor.pipeline import run_auditor
 from auditor.reporter import (
     display_category_issues,
     display_missing_report,
@@ -43,17 +40,13 @@ def main():
             load_rules(args.category_rules, "category_rules")
             if args.category_rules else None
         )
-        dataset_summary, column_profile = profile_dataset(df)
-        missing_report = detect_missing_values(df)
-        type_report = detect_type_issues(df, type_rules)
-        category_report = detect_category_issues(df, category_rules)
-        outliers_report = detect_outliers_iqr(df)
+        report = run_auditor(df, type_rules, category_rules)
 
-        display_profile(df, dataset_summary, column_profile)
-        display_missing_report(df, missing_report)
-        display_type_issues(df, type_report)
-        display_category_issues(df, category_report)
-        display_outliers_report(df, outliers_report)
+        display_profile(df, report["dataset_summary"], report["column_profile"])
+        display_missing_report(df, report["missing_report"])
+        display_type_issues(df, report["type_report"])
+        display_category_issues(df, report["category_report"])
+        display_outliers_report(df, report["outliers_report"])
     except (FileNotFoundError, ValueError) as error:
         print(f"\nError: {error}")
 

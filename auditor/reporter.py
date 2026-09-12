@@ -1,4 +1,6 @@
 
+from auditor.profiler import _missing_mask
+
 
 def display_profile(df, dataset_summary, column_profile):
     """
@@ -37,8 +39,9 @@ def display_missing_report(df, missing_report):
     print("\nMISSING-VALUE REPORT")
     print("=" * 60)
 
-    total_missing = int(df.isna().sum().sum())
-    rows_with_missing = int(df.isna().any(axis=1).sum())
+    missing = _missing_mask(df)
+    total_missing = int(missing.sum().sum())
+    rows_with_missing = int(missing.any(axis=1).sum())
 
     print(f"Total missing cells: {total_missing}")
     print(f"Rows containing missing values: {rows_with_missing}")
