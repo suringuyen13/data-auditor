@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
-from examples.example_type_rule import type_rules as tRules
+from examples.type_infer_rule import type_rules as tRules
+from examples.category_rules import category_rules as CRules
 
 import pandas as pd
 
@@ -159,7 +160,7 @@ def validate_expected_type(series, rule):
         invalid_map = non_missing & converted.isna()
 
     elif expected_type == "date":
-        date_format = rule.get("format")
+        date_format = rule.get("format", "mixed")
         converted = pd.to_datetime(series, format=date_format, errors="coerce")
 
         invalid_map = non_missing & converted.isna()
@@ -214,7 +215,7 @@ def validate_expected_type(series, rule):
         "invalid_values": series[invalid_map].tolist()
     }
 
-def type_inference(series, THRESHOLD=90):
+def type_inference(series, STRONG_THRESHOLD=90, MIN_THRESHOLD=60):
     """
     Suggest a data type this column most likely represents
     """
@@ -281,11 +282,12 @@ def type_inference(series, THRESHOLD=90):
     # 1. boolean
     bool_result=validate_expected_type(series, {"type": "boolean"})
     bool_compatibility=round(100-(bool_result["invalid_percentage"]),2)
-    if bool_compatibility >= THRESHOLD:
+    if bool_compatibility >= MIN_THRESHOLD:
         candidates.append({
             "type": "boolean",
             "confidence": bool_compatibility,
-            "validation": bool_result
+            "validation": bool_result,
+            "reason": "Values accepted Boolean representations such as true/false, yes/no, or 1/0."
         })
 
     # 2. numeric
@@ -295,36 +297,54 @@ def type_inference(series, THRESHOLD=90):
     integer_result = validate_expected_type(series, {"type": "integer"})
     integer_compatibility=round(100-(integer_result["invalid_percentage"]),2)
 
-    if numeric_compatibility >= THRESHOLD:
+    if numeric_compatibility >= MIN_THRESHOLD:
         if integer_compatibility == numeric_compatibility:
             candidates.append({
                 "type": "integer",
                 "confidence": integer_compatibility,
-                "validation": integer_result
+                "validation": integer_result,
+                "reason": "Values can be converted to whole numbers without a decimal remainder"
             })
         else:
             candidates.append({
                 "type": "float",
                 "confidence": numeric_compatibility,
-                "validation": numeric_result
+                "validation": numeric_result,
+                "reason": "Values can be converted to numbers. Some compatible values contain decimals, so float is more appropriate than integer."
             })
 
     # 3. date
-    date_result = validate_expected_type(series, {"type": "date"})
-    date_compatibility=round(100-(date_result["invalid_percentage"]),2) #evidence 1
+    evidence = []
 
-    date_pattern = "^(?:\d{4}[-/]\d{1,2}[-/]\d{1,2} | \d{1,2}[-/]\d{1,2}[-/]\d{2,4})$"
+    date_pattern = r"^(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})$"
 
     has_date_shape = text_values.str.match(date_pattern, na=False)
     date_shape_percentage = round(has_date_shape.mean() * 100,2)
-    supporting_evidence_date = has_date_hints or (date_shape_percentage >= THRESHOLD) #evidence 2
+    supporting_evidence_date = has_date_hints or (date_shape_percentage >= MIN_THRESHOLD) #evidence 1
+    if has_date_hints:
+        evidence.append("the column name appears date-related")
+    if date_shape_percentage >= MIN_THRESHOLD:
+        evidence.append("values have a date-like structure")
 
-    if date_compatibility >= THRESHOLD & supporting_evidence_date:
-        candidates.append({
+    if supporting_evidence_date:
+        date_result = validate_expected_type(series, {
                 "type": "date",
-                "confidence": date_compatibility,
-                "validation": date_result
+                "format": "mixed"
             })
+        date_compatibility=round(100-(date_result["invalid_percentage"]),2) #evidence 2
+
+        if evidence:
+            evidence_message = "" + " and ".join(evidence) + "."
+        else:
+            evidence_message = "Values can be parsed as valid dates."
+
+        if date_compatibility >= MIN_THRESHOLD:
+            candidates.append({
+                    "type": "date",
+                    "confidence": date_compatibility,
+                    "validation": date_result,
+                    "reason": evidence_message
+                })
 
     # 4. string (no candidate)
     if not candidates:
@@ -361,7 +381,7 @@ def type_inference(series, THRESHOLD=90):
 
     if len(candidates) == 1:
         selected_candidate = candidates[0]
-        selection_reason = "This was the only candidate that met the threshold."
+        selection_reason = candidates[0].get("reason")
 
     else:
         multiple_candidates = True
@@ -412,10 +432,12 @@ def type_inference(series, THRESHOLD=90):
     selection_validation = selected_candidate["validation"]
     confidence = selected_candidate["confidence"]
 
-    if (confidence == 100):
+    if (confidence >= 90):
         classification = "strong suggestion"
-    else:
+    elif (confidence >= 60 and multiple_candidates):
         classification = "suggestion with exception"
+    else:
+        classification = "low-confidence suggestion"
 
     return {
             "column": series.name,
@@ -451,7 +473,7 @@ def detect_type_issues(df, type_rules):
             results.append({
                 "column": column,
                 "source": "configuration_error",
-                "error": "Column specified in rules was not found."
+                "error": "Column specified in data type rules was not found in the dataset."
             })
 
     for column in df.columns:
@@ -468,6 +490,9 @@ def detect_type_issues(df, type_rules):
     return results
 
 def display_type_issues(df, type_report):
+    print("\nDATA-TYPE VALIDATION/SUGGESTION")
+    print("=" * 60, end="")
+    
     for result in type_report:
         source = result["source"]
 
@@ -503,13 +528,415 @@ def display_type_issues(df, type_report):
                 print(f"Incompatible values: {result['incompatible_values']}")
 
             if result['multiple_candidates']:
-                print(f"Candidates: {result['candidates'] ["type" for candidate in candidates
-                ],}")
+                candidates = result.get("candidates", [])
+                print("Candidates: " + ", ".join(c['type'] for c in candidates))
 
+def _is_categorical(non_missing_series, THRESHOLD = 0.05):
+    dtype = non_missing_series.dtype
+    right_type = (
+        isinstance(dtype, pd.StringDtype)
+        or isinstance(dtype, pd.CategoricalDtype)
+        or dtype == object
+    )
+    
+    normalized_series = non_missing_series.astype("string").str.strip().str.casefold()
 
+    unique_count=normalized_series.nunique(dropna=True)
+    total_count = normalized_series.count()
 
+    if total_count == 0:
+        return False
 
-            
+    unique_ratio=unique_count / total_count
+
+    low_cardinality=False
+    if unique_ratio < THRESHOLD:
+        low_cardinality=True
+
+    classification = "is_categorical"
+    reason = ""
+
+    if not right_type:
+        classification = "not_selected_as_categorical"
+        reason = "The column was not selected for category detection because its data type or value structure does not appear categorical."
+    elif not low_cardinality:
+        classification = "high_cardinality_skipped"
+        reason = "Rare-category detection was skipped because large number of unique values indicating a possible identifier or high-cardinality column."
+
+    return {
+        "is_categorical_type": right_type,
+        "low_cardinality": low_cardinality,
+        "unique_count": unique_count,
+        "values_tested": total_count,
+        "cardinality_ratio": unique_ratio,
+        "classification": classification,
+        "reason": reason
+    }
+
+def _categories_normalization(series, allowed_rules):
+    allowed_values = allowed_rules.get("allowed_values", [])
+    case_sensitive = allowed_rules.get("case_sensitive", False)
+    strip_whitespace = allowed_rules.get("strip_whitespace", True)
+
+    normalized_series=series.astype("string")
+    normalized_allowed_values = [str(v) for v in allowed_values]
+
+    if not case_sensitive:
+        normalized_series=normalized_series.str.casefold()
+        normalized_allowed_values=[v.casefold() for v in normalized_allowed_values]
+
+    if strip_whitespace:
+        normalized_series=normalized_series.str.strip()
+        normalized_allowed_values= [v.strip() for v in normalized_allowed_values]
+
+    return {
+        "normalized_series": normalized_series,
+        "normalized_allowed_values": normalized_allowed_values,
+        "allowed_values": allowed_values
+    }
+
+def validate_allowed_categories(series, normalization):
+    non_missing_series = series.dropna()
+    non_missing = series.notna()
+    values_tested = len(non_missing_series)
+
+    normalized_series= normalization["normalized_series"]
+    normalized_allowed_values = normalization["normalized_allowed_values"]
+    # future application: normalization_collision - identical allowed_values after normalization
+
+    if not normalized_allowed_values:
+        return {
+            "column": series.name,
+            "classification": "configuration_error",
+            "error": "The allowed-values rule for column is missing or has an invalid format."
+        }
+
+    invalid_mask = non_missing & ~normalized_series.isin(normalized_allowed_values)
+    invalid_count = int(invalid_mask.sum())
+
+    classification = "outside_allowed_values"
+    reason = "Some/All nonmissing values do not match the configured allowed categories."
+
+    if invalid_count == 0:
+        classification = "all_values_allowed"
+        reason = "All nonmissing values match the configured allowed categories."
+
+    invalid_percentage = round((invalid_count / values_tested) * 100, 2)
+
+    invalid_series = series[invalid_mask]
+
+    return {
+        "values_tested": values_tested,
+        "invalid_count": invalid_count,
+        "invalid_percentage": invalid_percentage,
+        "invalid_records": {
+            value: {
+                "count": int(count),
+                "rows": invalid_series[invalid_series == value].index.tolist()
+            }
+            for value, count in invalid_series.value_counts().items()
+        },
+        "classification": classification,
+        "reason": reason,
+        "format_inconsistencies": detect_format_inconsistencies(series, normalization["allowed_values"])
+    }
+
+def detect_format_inconsistencies(series, allowed_values):
+    non_missing = series.notna()
+    normalized_series=series.astype("string")
+
+    allowed_casefold = [v.casefold() for v in allowed_values]
+
+    cap_mask = non_missing & ~normalized_series.str.strip().isin(allowed_values)
+    cap_invalid_count = int(cap_mask.sum())
+
+    whitespace_mask = non_missing & ~normalized_series.str.casefold().isin(allowed_casefold)
+    whitespace_invalid_count = int(whitespace_mask.sum())
+
+    if cap_invalid_count > 0 and whitespace_invalid_count > 0:
+        classification = "case_and_whitespace_inconsistency"
+        reason = "Some/All values match an allowed category only after both capitalization and whitespace normalization."
+    elif cap_invalid_count > 0:
+        classification = "capitalization_inconsistency"
+        reason = "Values capitalization is inconsistent with the canonical allowed values."
+    elif whitespace_invalid_count > 0:
+        classification = "whitespace_inconsistency"
+        reason = "Values contain leading or trailing whitespace but otherwise match an allowed category."
+    else:
+        classification = "no_formatting_inconsistencies"
+        reason = "No formatting inconsistencies was found."
+
+    format_mask = non_missing & ~normalized_series.isin(allowed_values)
+
+    return {
+        "capitalization_count": cap_invalid_count,
+        "whitespace_count": whitespace_invalid_count,
+        "affected_rows": series.index[format_mask].tolist(),
+        "affected_values": series[format_mask].tolist(),
+        "classification": classification,
+        "reason": reason
+    }
+
+def detect_rare_categories(series, normalization, threshold):
+    normalized_series = normalization["normalized_series"]
+
+    category_proportions = normalized_series.value_counts(normalize=True)
+    rare_categories = category_proportions[category_proportions < threshold].index # series keeps only names of rare cateories
+    # future application: suggest threshold is too small for small dataset size
+
+    rare_mask = series.notna() & series.isin(rare_categories)
+    rare_series = series[rare_mask]
+
+    rare_category_count = int(rare_mask.sum())
+
+    if rare_category_count == 0:
+        classification = "no_rare_categories"
+        reason = "No valid category appears below the rarity threshold."
+    else:
+        classification = "rare_categories_detected"
+        reason = "There are valid categories appear below the rarity threshold. Rare categories are statistical warnings and are not necessarily invalid."
+
+    return {
+        "check_performed": True,
+        "rare_category_count": int(rare_mask.sum()),
+        "rare_values": series[rare_mask].tolist(),
+        "rare_records": {
+            value: {
+                "count": int(count),
+                "rows": rare_series[rare_series == value].index.tolist()
+            }
+            for value, count in rare_series.value_counts().items()
+        },
+        "classification": classification,
+        "reason": reason
+    }
+
+def detect_category_issues(df, category_rules):
+    results=[]
+
+    if category_rules is None:
+        category_rules = {}
+
+    # check invalid column name in type_rules
+    for column in category_rules:
+        if column not in df.columns:
+            results.append({
+                "column": column,
+                "classification": "no_nonmissing_values",
+                "error": "Column specified in category rules was not found in the dataset."
+            })
+
+    for column in df.columns:
+        non_missing_series = df[column].dropna()
+        values_tested = len(non_missing_series)
+        if values_tested == 0:
+            results.append({
+                "column": column,
+                "classification": "configuration_error",
+                "error": "No nonmissing values are available for category detection."
+            })
+            continue
+
+        column_report = {"column": column}
+        pre_detect_check = _is_categorical(non_missing_series)
+        is_categorical_type = pre_detect_check["is_categorical_type"]
+        low_cardinality = pre_detect_check["low_cardinality"]
+
+        if not is_categorical_type:
+            result = pre_detect_check # not_selected_as_categorical: cl+reason
+            column_report["is_categorical"] = result
+            results.append(column_report)
+            continue
+
+        rule = category_rules.get(column, {})
+        normalization = _categories_normalization(df[column], rule)
+        if column in category_rules:
+            result = validate_allowed_categories(df[column], normalization) # configuration_error, outside_allowed_values, all_values_allowed
+                # + case_and_whitespace_inconsistency, capitalization_inconsistency, whitespace_inconsistency, no_formatting_inconsistencies
+            column_report["validation"] = result
+
+        if not low_cardinality:
+            result = pre_detect_check # high_cardinality_skipped
+            column_report["high_cardinality"] = result
+            results.append(column_report)
+            continue
+
+        rare_threshold = rule.get("rare_threshold", 0.01)
+        result = detect_rare_categories(df[column], normalization, rare_threshold) # rare_categories_detected, no_rare_categories
+        column_report["rare_categories"] = result
+        results.append(column_report)
+        
+    return results
+
+def display_category_issues(df, issues_report):
+    print("\nUNUSUAL CATEGORY DETECTION")
+    print("=" * 60, end="")
+    
+    for result in issues_report:
+        print(f"\nColumn: {result['column']}")
+        if "classification" in result:
+            print(f"Classification: {result['classification']}")
+            print(f"Error: {result['error']}") # error
+            continue
+
+        if "is_categorical" in result:
+            is_categorical = result["is_categorical"]
+            print(f"Classification: {is_categorical['classification']}")
+            print(f"Reason: {is_categorical['reason']}")
+            continue
+
+        if "validation" in result:
+            validation = result["validation"]
+            print("-- Allowed categories Validation --")
+            print(f"Classification: {validation['classification']}")
+            print(f"Reason: {validation['reason']}")
+            print(f"Values tested: {validation['values_tested']}")
+            print(f"Invalid values count: {validation['invalid_count']}")
+
+            if validation['invalid_count'] != 0:
+                print(f"Invalid percentage: {validation['invalid_percentage']}")
+                print("Invalid values:")
+                for value, info in validation["invalid_records"].items():
+                    print(f"   {value}: count={info['count']}, rows={info['rows']}")  
+
+            format = validation["format_inconsistencies"]
+            print("-- Format inconsistencies Detection --")
+            print(f"Classification: {format['classification']}")
+            print(f"Reason: {format['reason']}")
+            if format['classification'] != 'no_formatting_inconsistencies':
+                if format['classification'] == 'capitalization_inconsistency':
+                    print(f"Cap inconsistency count: {format['capitalization_count']}")
+                elif format['classification'] == 'whitespace_inconsistency':
+                    print(f"Whitespace inconsistency count: {format['whitespace_count']}")
+                else:
+                    print(f"Cap inconsistency count: {format['capitalization_count']}")
+                    print(f"Whitespace inconsistency count: {format['whitespace_count']}")
+                print(f"Affected values: {format['affected_values']}")
+                print(f"Affected rows: {format['affected_rows']}")
+
+        if "high_cardinality" in result:
+            high_cardinality = result["high_cardinality"]
+            print("-- High category cardinality detected --")
+            print(f"Classification: {high_cardinality['classification']}")
+            print(f"Reason: {high_cardinality['reason']}")
+            print(f"Values tested: {high_cardinality['values_tested']}")
+            print(f"Unique count: {high_cardinality['unique_count']}")
+            print(f"Unique-to-All ratio: {high_cardinality['cardinality_ratio']}")
+            continue
+
+        if "rare_categories" in result:
+            rare_categories = result["rare_categories"]
+            print("-- Rare categories Detection --")
+            print(f"Classification: {rare_categories['classification']}")
+            print(f"Reason: {rare_categories['reason']}")
+            print(f"Rare category count: {rare_categories['rare_category_count']}")
+            print("Rare values:")
+            for value, info in rare_categories["rare_records"].items():
+                print(f"   {value}: count={info['count']}, rows={info['rows']}")  
+
+def detect_outliers_iqr(df):
+    """
+    Detect outliers in each DataFrame column using the 1.5 * IQR method.
+    """
+    results = []
+
+    for column in df.columns:
+        series = df[column]
+        is_numeric = pd.api.types.is_numeric_dtype(series)
+        is_boolean = pd.api.types.is_bool_dtype(series)
+        non_missing_series = series.dropna()
+        values_tested = len(non_missing_series)
+
+        if not is_numeric or is_boolean:
+            results.append({
+                "column": column,
+                "check_performed": False,
+                "values_tested": values_tested,
+                "outlier_count": 0,
+                "classification": "not_numeric_skipped",
+                "reason": "IQR outlier detection applies only to numeric columns."
+            })
+            continue
+
+        if values_tested == 0:
+            results.append({
+                "column": column,
+                "check_performed": False,
+                "values_tested": 0,
+                "outlier_count": 0,
+                "classification": "no_nonmissing_values",
+                "reason": "No nonmissing values are available for IQR outlier detection."
+            })
+            continue
+
+        q1 = non_missing_series.quantile(0.25)
+        q3 = non_missing_series.quantile(0.75)
+        iqr = q3 - q1
+        lower_bound = q1 - (1.5 * iqr)
+        upper_bound = q3 + (1.5 * iqr)
+
+        outlier_mask = (series < lower_bound) | (series > upper_bound)
+        outlier_series = series[outlier_mask]
+        outlier_count = int(outlier_mask.sum())
+        outlier_percentage = round((outlier_count / values_tested) * 100, 2)
+
+        if outlier_count == 0:
+            classification = "no_outliers_detected"
+            reason = "No nonmissing values fall outside the IQR bounds."
+        else:
+            classification = "outliers_detected"
+            reason = "Values fall below the lower IQR bound or above the upper IQR bound."
+
+        results.append({
+            "column": column,
+            "check_performed": True,
+            "values_tested": values_tested,
+            "q1": q1,
+            "q3": q3,
+            "iqr": iqr,
+            "lower_bound": lower_bound,
+            "upper_bound": upper_bound,
+            "outlier_count": outlier_count,
+            "outlier_percentage": outlier_percentage,
+            "outlier_values": outlier_series.tolist(),
+            "outlier_records": {
+                value: {
+                    "count": int(count),
+                    "rows": outlier_series[outlier_series == value].index.tolist()
+                }
+                for value, count in outlier_series.value_counts().items()
+            },
+            "classification": classification,
+            "reason": reason
+        })
+
+    return results
+
+def display_outliers_report(df, outlisers_report):
+    print("\nIQR OUTLIER DETECTION")
+    print("=" * 60, end="")
+
+    for result in outlisers_report:
+        print(f"\nColumn: {result['column']}")
+        print(f"Classification: {result['classification']}")
+        print(f"Reason: {result['reason']}")
+        print(f"Values tested: {result['values_tested']}")
+
+        if not result["check_performed"]:
+            continue
+
+        print(f"Q1: {result['q1']}")
+        print(f"Q3: {result['q3']}")
+        print(f"IQR: {result['iqr']}")
+        print(f"Lower bound: {result['lower_bound']}")
+        print(f"Upper bound: {result['upper_bound']}")
+        print(f"Outlier count: {result['outlier_count']}")
+        print(f"Outlier percentage: {result['outlier_percentage']}%")
+
+        if result["outlier_count"] != 0:
+            print("Outlier values:")
+            for value, info in result["outlier_records"].items():
+                print(f"   {value}: count={info['count']}, rows={info['rows']}")
 
 
 
@@ -530,11 +957,15 @@ def main():
 
         dataset_summary, column_profile = profile_dataset(df)
         missing_report = detect_missing_values(df)
-        type_report=detect_type_issues(df,tRules)
+        type_report = detect_type_issues(df,tRules)
+        category_report = detect_category_issues(df, CRules)
+        outliers_report = detect_outliers_iqr(df)
 
         display_profile(df, dataset_summary, column_profile)
         display_missing_report(df, missing_report)
         display_type_issues(df, type_report)
+        display_category_issues(df, category_report)
+        display_outliers_report(df, outliers_report)
 
     except (FileNotFoundError, ValueError) as error:
         print(f"\nError: {error}")
