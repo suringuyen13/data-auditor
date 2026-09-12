@@ -1,8 +1,0 @@
-- user clean step by step, or report -> clean -> report?
-  --> so that in category_issues, type is already defined -> auditor prioritizes categorical types first validation. but if not defined, auditor overrides user's rules for validation over categorical type check
-
-1. category_issues
-- typo normalization not yet done
-- after validate_allowed_categories return configuration_error (malformed allowed_values list) -> stil perform detect_rare_categories --> stop, or still but put message?
-- If every nonmissing value is outside the allowed list, rare detection has no valid categories left to analyze --> has not handled
-- If the DataFrame has duplicate column names, then: df[column] will return DataFrame rather than Series
